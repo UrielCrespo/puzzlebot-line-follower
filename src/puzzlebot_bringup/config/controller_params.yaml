@@ -1,0 +1,13 @@
+line_controller_node:
+  ros__parameters:
+    kp: 0.8
+    ki: 0.005
+    kd: 0.24
+    integral_max: 0.3
+    v_base: 0.10
+    v_min: 0.04
+    w_max: 1.5
+    alpha_look: 0.4
+    lost_timeout: 0.8
+    traffic_timeout: 1.0
+    control_rate: 20.0
