@@ -1,0 +1,6 @@
+vision_node:
+  ros__parameters:
+    roi_top: 0.4
+    blur_kernel: 5
+    morph_kernel: 5
+    debug: true
