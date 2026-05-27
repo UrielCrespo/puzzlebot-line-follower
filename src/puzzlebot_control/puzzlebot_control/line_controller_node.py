@@ -33,17 +33,17 @@ class LineControllerNode(Node):
         # Las ganancias iniciales son estimadas — afinar con MATLAB
         # después del experimento de identificación.
         # kp=0.8 equivale a kp=0.005 con error en píxeles (×160)
-        self.declare_parameter('kp', 0.8)
+        self.declare_parameter('kp', 1.0)
         self.declare_parameter('ki', 0.005)
-        self.declare_parameter('kd', 0.24)
+        self.declare_parameter('kd', 0.485)
 
         # integral_max: límite del anti-windup
         # Evita que el integral crezca sin límite en curvas largas
-        self.declare_parameter('integral_max', 0.3)
+        self.declare_parameter('integral_max', 0.25)
 
         # ── Parámetros de velocidad ───────────────────────────────
         # v_base: velocidad en recta (m/s)
-        self.declare_parameter('v_base', 0.10)
+        self.declare_parameter('v_base', 0.15)
 
         # v_min: velocidad mínima en curva cerrada (m/s)
         # El robot nunca para aunque el error sea máximo
@@ -51,7 +51,7 @@ class LineControllerNode(Node):
 
         # w_max: omega máximo (rad/s)
         # Limita el giro para no desestabilizar el robot
-        self.declare_parameter('w_max', 1.5)
+        self.declare_parameter('w_max', 1.8)
 
         # ── Parámetros de mezcla lookahead ────────────────────────
         # alpha_look: peso del error lookahead en la mezcla
@@ -59,14 +59,14 @@ class LineControllerNode(Node):
         # 0.0 = solo error inmediato (reactivo)
         # 1.0 = solo lookahead (anticipativo)
         # 0.4 = balance recomendado para curvas de 180°
-        self.declare_parameter('alpha_look', 0.4)
+        self.declare_parameter('alpha_look', 0.70)
 
         # ── Parámetros de watchdog ────────────────────────────────
         # lost_timeout: segundos sin línea detectada antes de frenar
         # El vision_node ya maneja 0.5s internamente, pero el
         # controlador necesita su propia capa de seguridad para
         # distinguir error=0 por línea centrada vs línea perdida
-        self.declare_parameter('lost_timeout', 0.8)
+        self.declare_parameter('lost_timeout', 2.2)
 
         # traffic_timeout: segundos sin mensaje de semáforo
         # Si la Rubik Pi se desconecta → asumir UNKNOWN y continuar
@@ -110,6 +110,10 @@ class LineControllerNode(Node):
         self.red_latched      = False
         self.last_traffic_time = self.get_clock().now()
         self.last_traffic_log  = ''
+
+
+        # obtencion de parametros para matlab
+        self.start_time = self.get_clock().now()
 
         # ── Timer del loop de control ─────────────────────────────
         rate = self.get_parameter('control_rate').value
@@ -291,11 +295,14 @@ class LineControllerNode(Node):
         cmd.angular.z = omega
         self.cmd_pub.publish(cmd)
 
+        t_elapsed = (now - self.start_time).nanoseconds / 1e9
+
         self.get_logger().info(
+            f't={t_elapsed:.4f} '
             f'SEM={self.traffic_state} | '
-            f'e={error:.3f} '
+            f'e={error:.6f} '
             f'(main={self.error_main:.3f} look={self.error_look:.3f}) | '
-            f'v={v:.3f} w={omega:.3f}'
+            f'v={v:.3f} w={omega:.6f}'
         )
 
     def _publish_stop(self):
