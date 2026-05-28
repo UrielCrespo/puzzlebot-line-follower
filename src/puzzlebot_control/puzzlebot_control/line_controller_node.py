@@ -94,6 +94,11 @@ class LineControllerNode(Node):
             self.traffic_callback, 10
         )
 
+        self.create_subscription(
+                String, '/traffic_sign_data',
+                self.traffic_sign_callback, 10
+        )
+
         # ── Variables de estado PID ───────────────────────────────
         self.integral  = 0.0
         self.prev_error = 0.0
@@ -111,6 +116,10 @@ class LineControllerNode(Node):
         self.last_traffic_time = self.get_clock().now()
         self.last_traffic_log  = ''
 
+        # -- Variables de estado de señales de tráafico
+        self.sign_state = 'NONE'
+        self.sign_timer = 0.0
+        self.sign_countdown = 0.0
 
         # obtencion de parametros para matlab
         self.start_time = self.get_clock().now()
@@ -172,6 +181,16 @@ class LineControllerNode(Node):
         if log != self.last_traffic_log:
             self.get_logger().info(log)
             self.last_traffic_log = log
+
+    def traffic_sign_callback(self, msg):
+    """
+    Recibe la señal de tráfico detectada por el detector_node.
+    Solo actualiza el estado — la reacción ocurre en timer_cb.
+    """
+        sign = msg.data.upper().strip()
+        if sign != self.sign_state:
+            self.get_logger().info(f'Señal detectada: {sign}')
+        self.sign_state = sign
 
     # ───────────────────────────────────────────────────────────────
     # PID ANGULAR
@@ -244,6 +263,26 @@ class LineControllerNode(Node):
             self._publish_stop()
             return
 
+        # ── Prioridad 1.5: señales de tráfico ─────────────────────────
+        if self.sign_cooldown > 0:
+            self.sign_cooldown -= dt
+
+        sign = self.sign_state
+
+        if sign == 'STOP' and self.sign_cooldown <= 0:
+            # Detener el robot por 3 segundos
+            self._publish_stop()
+            self.sign_cooldown = 3.0
+            return
+
+        elif sign == 'ROADWORK_AHEAD':
+            # Reducir velocidad a la mitad — se aplica más adelante en el cálculo
+            pass  # se maneja abajo en el cálculo de v
+
+        elif sign == 'GIVE_WAY':
+            # Reducir velocidad y ceder — similar a roadwork pero más suave
+            pass  # se maneja abajo en el cálculo de v
+
         # ── Prioridad 2: watchdog semáforo ─────────────────────
         # Si no llega mensaje de la Rubik Pi por más de traffic_timeout
         # asumir UNKNOWN y continuar — fallo de red no paraliza el robot
@@ -290,6 +329,12 @@ class LineControllerNode(Node):
             v     *= 0.5
             omega *= 0.5
 
+        # Modificadores por señal de tráfico
+        if self.sign_state == 'ROADWORK_AHEAD':
+            v *= 0.5
+        elif self.sign_state == 'GIVE_WAY':
+            v *= 0.4
+        
         cmd = Twist()
         cmd.linear.x  = v
         cmd.angular.z = omega
