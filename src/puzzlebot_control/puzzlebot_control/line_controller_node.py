@@ -3,21 +3,38 @@
 # line_controller_node.py
 # Controlador PID para el seguidor de línea del PuzzleBot.
 #
-# Recibe el error lateral del vision_node y publica velocidades
-# al robot. Integra el semáforo de la Rubik Pi.
+# Recibe el error lateral del perception_node y publica velocidades
+# al robot. Integra:
+#   - semáforo de la Rubik Pi
+#   - detector YOLO de señales de tráfico
 #
 # Tópicos:
-#   Suscribe:  /perception/line_error    (Float32MultiArray)
-#              /perception/line_detected (Bool)
-#              /traffic_light_state      (String)
-#   Publica:   /cmd_vel                  (Twist)
+#   Suscribe:
+#       /perception/line_error       (Float32MultiArray)
+#       /perception/line_detected    (Bool)
+#       /traffic_light_state         (String)
+#       /detecciones                 (String JSON desde YOLO)
+#
+#   Publica:
+#       /cmd_vel                     (Twist)
+#
+# Formato esperado de /detecciones:
+# [
+#   {
+#     "clase": "STOP",
+#     "confianza": 0.87,
+#     "bbox": [x1, y1, x2, y2]
+#   }
+# ]
 # ═══════════════════════════════════════════════════════════════════
 
+import json
 import rclpy
+import numpy as np
+
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float32MultiArray, Bool, String
-import numpy as np
 
 
 class LineControllerNode(Node):
@@ -29,114 +46,115 @@ class LineControllerNode(Node):
         super().__init__('line_controller_node')
 
         # ── Parámetros PID ────────────────────────────────────────
-        # El error viene normalizado [-1, 1] del vision_node.
-        # Las ganancias iniciales son estimadas — afinar con MATLAB
-        # después del experimento de identificación.
-        # kp=0.8 equivale a kp=0.005 con error en píxeles (×160)
-        self.declare_parameter('kp', 1.0)
-        self.declare_parameter('ki', 0.005)
-        self.declare_parameter('kd', 0.485)
+        self.declare_parameter('kp', 0.55)
+        self.declare_parameter('ki', 0.0)
+        self.declare_parameter('kd', 0.10)
 
-        # integral_max: límite del anti-windup
-        # Evita que el integral crezca sin límite en curvas largas
-        self.declare_parameter('integral_max', 0.25)
+        # Anti-windup
+        self.declare_parameter('integral_max', 0.15)
 
         # ── Parámetros de velocidad ───────────────────────────────
-        # v_base: velocidad en recta (m/s)
-        self.declare_parameter('v_base', 0.15)
-
-        # v_min: velocidad mínima en curva cerrada (m/s)
-        # El robot nunca para aunque el error sea máximo
-        self.declare_parameter('v_min', 0.04)
-
-        # w_max: omega máximo (rad/s)
-        # Limita el giro para no desestabilizar el robot
-        self.declare_parameter('w_max', 1.8)
+        self.declare_parameter('v_base', 0.05)
+        self.declare_parameter('v_min', 0.0)
+        self.declare_parameter('w_max', 0.55)
 
         # ── Parámetros de mezcla lookahead ────────────────────────
-        # alpha_look: peso del error lookahead en la mezcla
-        # error = (1 - alpha_look) * error_main + alpha_look * error_look
-        # 0.0 = solo error inmediato (reactivo)
-        # 1.0 = solo lookahead (anticipativo)
-        # 0.4 = balance recomendado para curvas de 180°
-        self.declare_parameter('alpha_look', 0.70)
+        self.declare_parameter('alpha_look', 0.20)
 
-        # ── Parámetros de watchdog ────────────────────────────────
-        # lost_timeout: segundos sin línea detectada antes de frenar
-        # El vision_node ya maneja 0.5s internamente, pero el
-        # controlador necesita su propia capa de seguridad para
-        # distinguir error=0 por línea centrada vs línea perdida
-        self.declare_parameter('lost_timeout', 2.2)
-
-        # traffic_timeout: segundos sin mensaje de semáforo
-        # Si la Rubik Pi se desconecta → asumir UNKNOWN y continuar
-        # El robot no debe pararse por un fallo de red
+        # ── Watchdogs ─────────────────────────────────────────────
+        self.declare_parameter('lost_timeout', 0.25)
         self.declare_parameter('traffic_timeout', 1.0)
-
-        # control_rate: frecuencia del loop de control (Hz)
-        # Independiente de los fps de la cámara
         self.declare_parameter('control_rate', 20.0)
+
+        # ── Señales YOLO ─────────────────────────────────────────
+        self.declare_parameter('sign_topic', '/detecciones')
+        self.declare_parameter('sign_confidence_min', 0.45)
+        self.declare_parameter('sign_timeout', 0.8)
+
+        # Tiempo que el robot se queda detenido al ver STOP
+        self.declare_parameter('stop_hold_seconds', 3.0)
+
+        # Escalas de velocidad por señales
+        self.declare_parameter('roadwork_speed_scale', 0.50)
+        self.declare_parameter('give_way_speed_scale', 0.40)
 
         # ── Publishers ────────────────────────────────────────────
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
 
         # ── Subscribers ───────────────────────────────────────────
         self.create_subscription(
-            Float32MultiArray, '/perception/line_error',
-            self.line_error_callback, 10
-        )
-        self.create_subscription(
-            Bool, '/perception/line_detected',
-            self.line_detected_callback, 10
-        )
-        self.create_subscription(
-            String, '/traffic_light_state',
-            self.traffic_callback, 10
+            Float32MultiArray,
+            '/perception/line_error',
+            self.line_error_callback,
+            10
         )
 
         self.create_subscription(
-                String, '/traffic_sign_data',
-                self.traffic_sign_callback, 10
+            Bool,
+            '/perception/line_detected',
+            self.line_detected_callback,
+            10
         )
 
-        # ── Variables de estado PID ───────────────────────────────
-        self.integral  = 0.0
+        self.create_subscription(
+            String,
+            '/traffic_light_state',
+            self.traffic_callback,
+            10
+        )
+
+        sign_topic = self.get_parameter('sign_topic').value
+        self.create_subscription(
+            String,
+            sign_topic,
+            self.traffic_sign_callback,
+            10
+        )
+
+        # ── Variables PID ─────────────────────────────────────────
+        self.integral = 0.0
         self.prev_error = 0.0
-        self.last_time  = self.get_clock().now()
+        self.last_time = self.get_clock().now()
 
-        # ── Variables de estado de visión ─────────────────────────
-        self.error_main    = 0.0
-        self.error_look    = 0.0
+        # ── Estado de línea ───────────────────────────────────────
+        self.error_main = 0.0
+        self.error_look = 0.0
         self.line_detected = False
         self.last_line_time = self.get_clock().now()
 
-        # ── Variables de estado de semáforo ───────────────────────
-        self.traffic_state    = 'UNKNOWN'
-        self.red_latched      = False
+        # ── Estado de semáforo ────────────────────────────────────
+        self.traffic_state = 'UNKNOWN'
+        self.red_latched = False
         self.last_traffic_time = self.get_clock().now()
-        self.last_traffic_log  = ''
+        self.last_traffic_log = ''
 
-        # -- Variables de estado de señales de tráafico
+        # ── Estado de señales YOLO ────────────────────────────────
         self.sign_state = 'NONE'
-        self.sign_timer = 0.0
-        self.sign_countdown = 0.0
+        self.sign_confidence = 0.0
+        self.last_sign_time = self.get_clock().now()
+        self.last_sign_log = ''
 
-        # obtencion de parametros para matlab
+        # STOP hold:
+        # stop_hold_remaining mantiene el robot detenido.
+        # stop_sign_latched evita que el mismo STOP dispare hold infinitamente.
+        self.stop_hold_remaining = 0.0
+        self.stop_sign_latched = False
+
+        # Tiempo para logs/experimentos
         self.start_time = self.get_clock().now()
 
-        # ── Timer del loop de control ─────────────────────────────
-        rate = self.get_parameter('control_rate').value
-        self.create_timer(1.0 / rate, self.timer_cb)
+        # ── Timer de control ──────────────────────────────────────
+        rate = float(self.get_parameter('control_rate').value)
+        self.create_timer(1.0 / max(rate, 1.0), self.timer_cb)
 
         self.get_logger().info('LineControllerNode iniciado — PID line follower')
+        self.get_logger().info(f'Escuchando señales YOLO en: {sign_topic}')
 
     # ───────────────────────────────────────────────────────────────
-    # CALLBACKS DE SUSCRIPCIÓN
-    # Solo guardan el último valor recibido.
-    # El procesamiento ocurre en el timer_cb a 20 Hz.
+    # CALLBACKS
     # ───────────────────────────────────────────────────────────────
     def line_error_callback(self, msg):
-        """Guarda el error lateral publicado por vision_node."""
+        """Guarda el error lateral publicado por perception_node."""
         if len(msg.data) >= 2:
             self.error_main = float(msg.data[0])
             self.error_look = float(msg.data[1])
@@ -145,25 +163,26 @@ class LineControllerNode(Node):
         """
         Guarda si la línea está visible.
         Actualiza el tiempo del último frame con línea detectada.
-        Esto permite al watchdog distinguir entre:
-          - error=0 porque la línea está centrada (detected=True)
-          - error=0 porque se perdió la línea (detected=False)
         """
-        self.line_detected = msg.data
-        if msg.data:
+        self.line_detected = bool(msg.data)
+
+        if self.line_detected:
             self.last_line_time = self.get_clock().now()
 
     def traffic_callback(self, msg):
         """
         Maneja el estado del semáforo de la Rubik Pi.
-        RED activa red_latched — el robot no avanza hasta GREEN.
-        YELLOW escala la velocidad a la mitad.
+        RED activa red_latched.
+        GREEN después de RED libera el latch.
+        YELLOW reduce velocidad en timer_cb.
         """
         state = msg.data.upper().strip()
+
         if state not in ['RED', 'YELLOW', 'GREEN', 'UNKNOWN']:
             state = 'UNKNOWN'
 
         self.last_traffic_time = self.get_clock().now()
+
         prev = self.traffic_state
         self.traffic_state = state
 
@@ -171,11 +190,10 @@ class LineControllerNode(Node):
             self.red_latched = True
 
         elif state == 'GREEN' and self.red_latched:
-            # Verde después de rojo: resetear integral para arranque limpio
             self.red_latched = False
-            self.integral    = 0.0
-            self.prev_error  = 0.0
-            self.last_time   = self.get_clock().now()
+            self.integral = 0.0
+            self.prev_error = 0.0
+            self.last_time = self.get_clock().now()
 
         log = f'Semaforo: {prev} → {state}'
         if log != self.last_traffic_log:
@@ -183,122 +201,231 @@ class LineControllerNode(Node):
             self.last_traffic_log = log
 
     def traffic_sign_callback(self, msg):
-    """
-    Recibe la señal de tráfico detectada por el detector_node.
-    Solo actualiza el estado — la reacción ocurre en timer_cb.
-    """
-        sign = msg.data.upper().strip()
-        if sign != self.sign_state:
-            self.get_logger().info(f'Señal detectada: {sign}')
+        """
+        Recibe detecciones del detector YOLO.
+
+        Espera JSON tipo:
+        [
+            {
+                "clase": "STOP",
+                "confianza": 0.87,
+                "bbox": [x1, y1, x2, y2]
+            }
+        ]
+
+        Si no hay detecciones, el detector debe publicar [].
+        """
+        try:
+            detections = json.loads(msg.data)
+        except Exception as e:
+            self.get_logger().warn(f'No pude leer JSON de /detecciones: {e}')
+            self.sign_state = 'NONE'
+            self.sign_confidence = 0.0
+            return
+
+        if not isinstance(detections, list) or len(detections) == 0:
+            self.sign_state = 'NONE'
+            self.sign_confidence = 0.0
+            self.stop_sign_latched = False
+            return
+
+        best_detection = None
+        best_confidence = -1.0
+
+        for detection in detections:
+            if not isinstance(detection, dict):
+                continue
+
+            confidence = float(detection.get('confianza', 0.0))
+
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_detection = detection
+
+        if best_detection is None:
+            self.sign_state = 'NONE'
+            self.sign_confidence = 0.0
+            return
+
+        min_conf = float(self.get_parameter('sign_confidence_min').value)
+
+        if best_confidence < min_conf:
+            self.sign_state = 'NONE'
+            self.sign_confidence = best_confidence
+            return
+
+        raw_class = str(best_detection.get('clase', 'NONE'))
+        sign = self._normalize_sign_name(raw_class)
+
         self.sign_state = sign
+        self.sign_confidence = best_confidence
+        self.last_sign_time = self.get_clock().now()
+
+        log = f'Señal YOLO: {sign} conf={best_confidence:.2f}'
+        if log != self.last_sign_log:
+            self.get_logger().info(log)
+            self.last_sign_log = log
+
+    # ───────────────────────────────────────────────────────────────
+    # NORMALIZACIÓN DE NOMBRES DE SEÑALES
+    # ───────────────────────────────────────────────────────────────
+    def _normalize_sign_name(self, name: str) -> str:
+        """
+        Convierte nombres de clase del modelo a nombres estándar.
+
+        Ajusta aquí los nombres exactos de tus clases YOLO si son distintos.
+        """
+        s = name.upper().strip()
+        s = s.replace(' ', '_')
+        s = s.replace('-', '_')
+
+        stop_aliases = [
+            'STOP',
+            'STOP_SIGN',
+            'ALTO',
+            'SIGN_STOP'
+        ]
+
+        roadwork_aliases = [
+            'ROADWORK',
+            'ROADWORK_AHEAD',
+            'WORK_AHEAD',
+            'CONSTRUCTION',
+            'OBRAS',
+            'OBRA'
+        ]
+
+        give_way_aliases = [
+            'GIVE_WAY',
+            'YIELD',
+            'CEDA',
+            'CEDA_EL_PASO'
+        ]
+
+        if s in stop_aliases:
+            return 'STOP'
+
+        if s in roadwork_aliases:
+            return 'ROADWORK_AHEAD'
+
+        if s in give_way_aliases:
+            return 'GIVE_WAY'
+
+        return s
 
     # ───────────────────────────────────────────────────────────────
     # PID ANGULAR
-    #
-    # Calcula omega a partir del error normalizado [-1, 1].
-    #
-    # Anti-windup: clip del integral entre ±integral_max
-    # Reset en cruce de cero: si el error cambia de signo,
-    # el integral se resetea para evitar sobreimpulso
     # ───────────────────────────────────────────────────────────────
     def _compute_pid(self, error: float, dt: float) -> float:
-        kp = self.get_parameter('kp').value
-        ki = self.get_parameter('ki').value
-        kd = self.get_parameter('kd').value
-        integral_max = self.get_parameter('integral_max').value
+        kp = float(self.get_parameter('kp').value)
+        ki = float(self.get_parameter('ki').value)
+        kd = float(self.get_parameter('kd').value)
+        integral_max = float(self.get_parameter('integral_max').value)
 
-        # Reset integral cuando el error cruza cero
-        # Evita sobreimpulso al salir de una curva
         if error * self.prev_error < 0:
             self.integral = 0.0
 
-        # Acumular integral con anti-windup
         self.integral += error * dt
-        self.integral  = float(np.clip(self.integral, -integral_max, integral_max))
+        self.integral = float(
+            np.clip(self.integral, -integral_max, integral_max)
+        )
 
-        # Término derivativo
         derivative = (error - self.prev_error) / dt if dt > 1e-6 else 0.0
         self.prev_error = error
 
         omega = kp * error + ki * self.integral + kd * derivative
-        w_max = self.get_parameter('w_max').value
-        return float(np.clip(omega, -w_max, w_max))
+
+        w_max = float(self.get_parameter('w_max').value)
+        omega = float(np.clip(omega, -w_max, w_max))
+
+        return omega
 
     # ───────────────────────────────────────────────────────────────
-    # VELOCIDAD LINEAL CON CURVATURE SCALE
-    #
-    # En vez de velocidad fija, reduce proporcional al giro.
-    # Más elegante que curve_brake fijo:
-    #   curvature_scale = 1 - |omega| / w_max * factor
-    # El robot frena suavemente en curvas y acelera en rectas.
+    # VELOCIDAD LINEAL
     # ───────────────────────────────────────────────────────────────
     def _compute_velocity(self, omega: float) -> float:
-        v_base = self.get_parameter('v_base').value
-        v_min  = self.get_parameter('v_min').value
-        w_max  = self.get_parameter('w_max').value
+        v_base = float(self.get_parameter('v_base').value)
+        v_min = float(self.get_parameter('v_min').value)
+        w_max = float(self.get_parameter('w_max').value)
+
+        if w_max <= 1e-6:
+            return v_min
 
         curvature_scale = 1.0 - min(abs(omega) / w_max, 0.65)
         v = v_base * curvature_scale
+
         return float(np.clip(v, v_min, v_base))
 
     # ───────────────────────────────────────────────────────────────
-    # LOOP DE CONTROL — 20 Hz
+    # LOOP DE CONTROL
     #
-    # Orden de prioridad:
-    #   1. Semáforo rojo → frenar siempre
-    #   2. Watchdog semáforo → si Rubik Pi se cae, asumir UNKNOWN
-    #   3. Watchdog línea perdida → si no hay línea, frenar
-    #   4. Control normal → mezclar errores, PID, publicar
+    # Prioridad:
+    #   1. STOP hold por señal STOP
+    #   2. Semáforo rojo
+    #   3. Watchdog semáforo
+    #   4. Watchdog línea
+    #   5. Control normal
     # ───────────────────────────────────────────────────────────────
     def timer_cb(self):
         now = self.get_clock().now()
-        dt  = (now - self.last_time).nanoseconds / 1e9
+        dt = (now - self.last_time).nanoseconds / 1e9
         self.last_time = now
 
         if dt <= 0.0:
             return
 
-        # ── Prioridad 1: semáforo rojo ─────────────────────────
+        # ── Prioridad 1: mantener STOP por tiempo definido ─────────
+        if self.stop_hold_remaining > 0.0:
+            self.stop_hold_remaining -= dt
+            self._publish_stop()
+            return
+
+        # ── Señales viejas expiran ────────────────────────────────
+        sign_timeout = float(self.get_parameter('sign_timeout').value)
+        sign_age = (now - self.last_sign_time).nanoseconds / 1e9
+
+        if sign_age > sign_timeout:
+            self.sign_state = 'NONE'
+            self.sign_confidence = 0.0
+            self.stop_sign_latched = False
+
+        # ── Prioridad 1.5: detectar nuevo STOP ────────────────────
+        if self.sign_state == 'STOP' and not self.stop_sign_latched:
+            hold_time = float(self.get_parameter('stop_hold_seconds').value)
+            self.stop_hold_remaining = hold_time
+            self.stop_sign_latched = True
+
+            self.integral = 0.0
+            self.prev_error = 0.0
+
+            self.get_logger().warn(
+                f'STOP detectado → frenando {hold_time:.1f}s'
+            )
+
+            self._publish_stop()
+            return
+
+        if self.sign_state != 'STOP':
+            self.stop_sign_latched = False
+
+        # ── Prioridad 2: semáforo rojo ────────────────────────────
         if self.red_latched:
             self._publish_stop()
             return
 
-        # ── Prioridad 1.5: señales de tráfico ─────────────────────────
-        if self.sign_cooldown > 0:
-            self.sign_cooldown -= dt
-
-        sign = self.sign_state
-
-        if sign == 'STOP' and self.sign_cooldown <= 0:
-            # Detener el robot por 3 segundos
-            self._publish_stop()
-            self.sign_cooldown = 3.0
-            return
-
-        elif sign == 'ROADWORK_AHEAD':
-            # Reducir velocidad a la mitad — se aplica más adelante en el cálculo
-            pass  # se maneja abajo en el cálculo de v
-
-        elif sign == 'GIVE_WAY':
-            # Reducir velocidad y ceder — similar a roadwork pero más suave
-            pass  # se maneja abajo en el cálculo de v
-
-        # ── Prioridad 2: watchdog semáforo ─────────────────────
-        # Si no llega mensaje de la Rubik Pi por más de traffic_timeout
-        # asumir UNKNOWN y continuar — fallo de red no paraliza el robot
-        traffic_timeout = self.get_parameter('traffic_timeout').value
+        # ── Prioridad 3: watchdog semáforo ────────────────────────
+        traffic_timeout = float(self.get_parameter('traffic_timeout').value)
         traffic_age = (now - self.last_traffic_time).nanoseconds / 1e9
 
         if traffic_age > traffic_timeout and self.traffic_state != 'UNKNOWN':
             self.get_logger().warn(
-                f'Rubik Pi desconectada ({traffic_age:.1f}s) → asumiendo UNKNOWN'
+                f'Rubik Pi semaforo sin mensajes ({traffic_age:.1f}s) '
+                f'→ asumiendo UNKNOWN'
             )
             self.traffic_state = 'UNKNOWN'
 
-        # ── Prioridad 3: watchdog línea perdida ────────────────
-        # Si el vision_node no detecta línea por más de lost_timeout
-        # frenar y resetear el integral
-        lost_timeout = self.get_parameter('lost_timeout').value
+        # ── Prioridad 4: watchdog línea perdida ───────────────────
+        lost_timeout = float(self.get_parameter('lost_timeout').value)
         line_age = (now - self.last_line_time).nanoseconds / 1e9
 
         if not self.line_detected and line_age > lost_timeout:
@@ -306,55 +433,58 @@ class LineControllerNode(Node):
                 f'Linea perdida {line_age:.2f}s → frenando'
             )
             self._publish_stop()
-            self.integral   = 0.0
+            self.integral = 0.0
             self.prev_error = 0.0
             return
 
-        # ── Prioridad 4: control normal ────────────────────────
-        alpha_look = self.get_parameter('alpha_look').value
+        # ── Prioridad 5: control normal ───────────────────────────
+        alpha_look = float(self.get_parameter('alpha_look').value)
+        alpha_look = float(np.clip(alpha_look, 0.0, 1.0))
 
-        # Mezclar error inmediato y lookahead
-        # alpha_look=0.4 → 60% reactivo + 40% anticipativo
         error = (1.0 - alpha_look) * self.error_main + \
-                 alpha_look        * self.error_look
+                alpha_look * self.error_look
 
-        # PID angular
         omega = self._compute_pid(error, dt)
-
-        # Velocidad con curvature scale
         v = self._compute_velocity(omega)
 
-        # Escalar por semáforo amarillo
+        # Semáforo amarillo: reducir velocidad y giro
         if self.traffic_state == 'YELLOW':
-            v     *= 0.5
+            v *= 0.5
             omega *= 0.5
 
-        # Modificadores por señal de tráfico
+        # Señales de tráfico
         if self.sign_state == 'ROADWORK_AHEAD':
-            v *= 0.5
+            scale = float(self.get_parameter('roadwork_speed_scale').value)
+            v *= scale
+
         elif self.sign_state == 'GIVE_WAY':
-            v *= 0.4
-        
+            scale = float(self.get_parameter('give_way_speed_scale').value)
+            v *= scale
+
         cmd = Twist()
-        cmd.linear.x  = v
-        cmd.angular.z = omega
+        cmd.linear.x = float(v)
+        cmd.angular.z = float(omega)
+
         self.cmd_pub.publish(cmd)
 
         t_elapsed = (now - self.start_time).nanoseconds / 1e9
 
         self.get_logger().info(
-            f't={t_elapsed:.4f} '
+            f't={t_elapsed:.3f} | '
             f'SEM={self.traffic_state} | '
-            f'e={error:.6f} '
+            f'SIGN={self.sign_state} conf={self.sign_confidence:.2f} | '
+            f'e={error:.4f} '
             f'(main={self.error_main:.3f} look={self.error_look:.3f}) | '
-            f'v={v:.3f} w={omega:.6f}'
+            f'v={v:.3f} w={omega:.3f}'
         )
 
+    # ───────────────────────────────────────────────────────────────
+    # UTILIDADES
+    # ───────────────────────────────────────────────────────────────
     def _publish_stop(self):
         self.cmd_pub.publish(Twist())
 
     def destroy_node(self):
-        # Al morir el nodo, frenar el robot
         self._publish_stop()
         super().destroy_node()
 
@@ -362,6 +492,7 @@ class LineControllerNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = LineControllerNode()
+
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
